@@ -81,16 +81,35 @@ def scrape():
     return avail, designer_ok
 
 
+SMTP_HOSTS = {"gmail.com": "smtp.gmail.com", "naver.com": "smtp.naver.com",
+              "daum.net": "smtp.daum.net", "hanmail.net": "smtp.daum.net"}
+
+
 def send_mail(subject, body):
-    user, pw, to = os.environ.get("SMTP_USER"), os.environ.get("SMTP_PASS"), os.environ.get("MAIL_TO")
+    user = (os.environ.get("SMTP_USER") or "").strip()
+    pw = (os.environ.get("SMTP_PASS") or "").replace(" ", "").strip()  # 앱 비밀번호의 공백 제거
+    to = (os.environ.get("MAIL_TO") or "").strip()
     if not (user and pw and to):
         return False
+    host = os.environ.get("SMTP_HOST") or SMTP_HOSTS.get(user.split("@")[-1].lower(), "smtp.gmail.com")
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"], msg["From"], msg["To"] = subject, user, to
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
-        s.login(user, pw)
-        s.send_message(msg)
-    return True
+    last = None
+    for port in (465, 587):  # 465(SSL) 실패 시 587(STARTTLS)로 재시도
+        try:
+            if port == 465:
+                s = smtplib.SMTP_SSL(host, 465, timeout=30)
+            else:
+                s = smtplib.SMTP(host, 587, timeout=30)
+                s.starttls()
+            with s:
+                s.login(user, pw)
+                s.send_message(msg)
+            return True
+        except Exception as e:
+            print(f"[메일] {host}:{port} 실패 - {type(e).__name__}: {e}")
+            last = e
+    raise last
 
 
 def send_telegram(text):
@@ -102,17 +121,24 @@ def send_telegram(text):
     return True
 
 
-def send_notion(title):
+def send_notion(title, when):
     token, db = os.environ.get("NOTION_TOKEN"), os.environ.get("NOTION_DB_ID")
     if not (token and db):
         return False
     h = {"Authorization": f"Bearer {token}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
     r = requests.get(f"https://api.notion.com/v1/databases/{db}", headers=h, timeout=20)
     r.raise_for_status()
-    title_prop = next(k for k, v in r.json()["properties"].items() if v["type"] == "title")
+    props = r.json()["properties"]
+    title_prop = next(k for k, v in props.items() if v["type"] == "title")
+    properties = {title_prop: {"title": [{"text": {"content": title}}]}}
+    date_prop = next((k for k, v in props.items() if v["type"] == "date"), None)
+    if date_prop:
+        properties[date_prop] = {"date": {"start": f"{TARGET_DATE}T{when}:00+09:00", "time_zone": "Asia/Seoul"}}
+    else:
+        print("[노션] 날짜(Date) 속성이 DB에 없어 날짜는 비워둡니다.")
     body = {
         "parent": {"database_id": db},
-        "properties": {title_prop: {"title": [{"text": {"content": title}}]}},
+        "properties": properties,
         "children": [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [
             {"type": "text", "text": {"content": "예약 바로가기", "link": {"url": URL}}}]}}],
     }
@@ -143,10 +169,12 @@ def main():
         title = f"[빈자리] {TARGET_DATE} {', '.join(new)} 남성 컷 ({DESIGNER})"
         text = f"{title}\n{URL}{note}"
         ok = []
-        for name, fn in (("메일", lambda: send_mail(title, text)), ("노션", lambda: send_notion(title)),
+        for name, fn in (("메일", lambda: send_mail(title, text)), ("노션", lambda: send_notion(title, new[0])),
                          ("텔레그램", lambda: send_telegram(text))):
             try:
-                ok.append(fn())
+                res = fn()
+                print(f"[{name}] " + ("전송 완료" if res else "건너뜀(Secrets 미설정)"))
+                ok.append(res)
             except Exception as e:
                 print(f"[오류] {name} 알림 실패: {e}")
                 ok.append(False)
